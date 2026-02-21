@@ -77,6 +77,12 @@ _MODEL_NAME    = "speechbrain/emotion-recognition-wav2vec2-IEMOCAP"
 _TARGET_SR     = 16_000   # model expects 16 kHz
 _MIN_DURATION  = 0.5      # seconds — skip segments shorter than this
 
+# Energy-based anger override:
+# If a segment's RMS energy is more than _ANGER_ENERGY_Z_THRESHOLD standard
+# deviations above the session mean, the customer tone is unusually loud →
+# the emotion is overridden (or boosted) to "angry".
+_ANGER_ENERGY_Z_THRESHOLD = 1.5   # Z-score above session mean that triggers override
+
 
 # Map SpeechBrain IEMOCAP codes → human-readable labels
 _LABEL_MAP = {
@@ -153,10 +159,39 @@ def detect_emotions(
     waveform, sr = _load_wav(audio_path)
     waveform = _to_16k_mono(waveform, sr)  # normalise to model requirements
 
+    # ── Pre-pass: compute per-segment RMS energy for anger override ────────
+    # Goal: if a customer's tone is significantly louder than the session
+    # baseline, we classify it as angry regardless of the model's label.
+    rms_values: List[float] = []
+    for seg in segments:
+        if seg.end_time - seg.start_time >= _MIN_DURATION:
+            rms_values.append(
+                _compute_segment_rms(waveform, seg.start_time, seg.end_time, _TARGET_SR)
+            )
+        else:
+            rms_values.append(0.0)
+
+    # Session-level energy baseline (mean ± std over valid segments)
+    valid_rms = [r for r in rms_values if r > 0.0]
+    if len(valid_rms) >= 2:
+        import statistics as _stats
+        _rms_mean = _stats.mean(valid_rms)
+        _rms_std  = _stats.stdev(valid_rms) or 1e-9
+        _anger_threshold = _rms_mean + _ANGER_ENERGY_Z_THRESHOLD * _rms_std
+        logger.debug(
+            f"[EmotionDetector] RMS baseline  mean={_rms_mean:.4f}  "
+            f"std={_rms_std:.4f}  anger_threshold={_anger_threshold:.4f}"
+        )
+    else:
+        _rms_mean = _rms_std = 0.0
+        _anger_threshold = float("inf")   # not enough data → no override
+    # ── End pre-pass ───────────────────────────────────────────────────────
+
     results: List[EmotionResult] = []
 
     for i, seg in enumerate(segments):
         duration = seg.end_time - seg.start_time
+        current_rms = rms_values[i]
 
         # Skip very short segments (likely silence / noise)
         if duration < _MIN_DURATION:
@@ -172,19 +207,43 @@ def detect_emotions(
 
         try:
             emotion, confidence = _infer_emotion(classifier, seg_wave)
-            results.append(EmotionResult(emotion=emotion, confidence=confidence))
-            lvl = "INFO" if emotion != "neutral" or confidence > 0.5 else "DEBUG"
-            logger.log(
-                lvl,
-                f"[EmotionDetector] Seg {i} [{seg.start_time:.1f}s–{seg.end_time:.1f}s] "
-                f"→ '{emotion}' ({confidence*100:.1f}%)"
-            )
         except Exception as exc:
             logger.warning(
                 f"[EmotionDetector] Seg {i} inference failed: {exc} "
                 f"→ defaulting to 'neutral'"
             )
-            results.append(EmotionResult(emotion="neutral", confidence=0.0))
+            emotion, confidence = "neutral", 0.0
+
+        # ── Energy-based anger override ────────────────────────────────────
+        # If the segment's RMS energy is significantly above the session mean
+        # (z-score > _ANGER_ENERGY_Z_THRESHOLD), the speaker's tone is much
+        # louder / more intense than usual → classify as angry.
+        if current_rms > _anger_threshold and _rms_std > 0:
+            z_score = (current_rms - _rms_mean) / _rms_std
+            # Confidence scales with how far above the threshold we are.
+            # Minimum 0.65, capped at 0.95.
+            energy_confidence = min(0.95, 0.65 + 0.06 * (z_score - _ANGER_ENERGY_Z_THRESHOLD))
+            if emotion != "angry":
+                logger.info(
+                    f"[EmotionDetector] Seg {i} [{seg.start_time:.1f}s–{seg.end_time:.1f}s] "
+                    f"energy override → 'angry'  "
+                    f"(RMS={current_rms:.4f}, z={z_score:.2f}, "
+                    f"was='{emotion}' @ {confidence*100:.1f}%)"
+                )
+                emotion = "angry"
+                confidence = max(confidence, energy_confidence)
+            else:
+                # Model already said angry — just reinforce confidence
+                confidence = max(confidence, energy_confidence)
+        # ── End energy override ────────────────────────────────────────────
+
+        results.append(EmotionResult(emotion=emotion, confidence=confidence))
+        lvl = "INFO" if emotion != "neutral" or confidence > 0.5 else "DEBUG"
+        logger.log(
+            lvl,
+            f"[EmotionDetector] Seg {i} [{seg.start_time:.1f}s–{seg.end_time:.1f}s] "
+            f"→ '{emotion}' ({confidence*100:.1f}%)"
+        )
 
     logger.info(
         f"[EmotionDetector] ✅ Emotions detected for {len(results)} segments."
@@ -232,6 +291,26 @@ def _infer_emotion(
 
 
 # ── Audio helpers ──────────────────────────────────────────────────────────
+
+def _compute_segment_rms(waveform: torch.Tensor, start_s: float, end_s: float, sr: int) -> float:
+    """
+    Compute the Root-Mean-Square (RMS) energy of [start_s, end_s] within
+    a 1-D, 16-kHz mono waveform tensor.
+
+    RMS is a reliable proxy for perceived loudness / speaking intensity.
+    A segment with unusually high RMS compared to the session baseline
+    signals an elevated / raised voice — a strong indicator of anger.
+
+    Returns
+    -------
+    float
+        RMS value ≥ 0.  Returns 0.0 for empty or near-silence segments.
+    """
+    seg = _slice_waveform(waveform, start_s, end_s, sr)
+    if seg.numel() == 0:
+        return 0.0
+    return float(torch.sqrt(torch.mean(seg.float() ** 2)).item())
+
 
 def _load_wav(path: Path) -> Tuple[torch.Tensor, int]:
     """Load a WAV file and return (waveform, sample_rate). Uses soundfile to avoid torchcodec on Windows."""
