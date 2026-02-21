@@ -17,6 +17,7 @@ from app.schemas import (
     PipelineResponse,
     PipelineSegment,
     InputType,
+    ConversationAnalyticsResponse,
 )
 from app.speech_pipeline.pipeline import (
     run_speech_pipeline_async,
@@ -167,7 +168,7 @@ async def analyze_text(
 
 @router.post(
     "/analyze",
-    response_model="ConversationAnalyticsResponse",
+    response_model=ConversationAnalyticsResponse,
     summary="Full conversation intelligence (audio or text)",
     description=(
         "Submit either an **audio file** (WAV/MP3) or a **text transcript**. "
@@ -190,8 +191,6 @@ async def analyze_conversation(
     session_id: Optional[str] = Form(default=None),
     settings: Settings = Depends(get_settings),
 ):
-    from app.schemas import ConversationAnalyticsResponse
-
     # ── 0. Validate input ─────────────────────────────────────────────────
     if audio_file is None and not text_transcript:
         raise HTTPException(
