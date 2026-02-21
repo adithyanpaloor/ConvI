@@ -21,7 +21,21 @@ async def lifespan(app: FastAPI):
     """Application startup / shutdown lifecycle."""
     logger.info(f"🚀 Starting {settings.app_name} v{settings.app_version}")
     logger.info(f"📌 Default domain: {settings.default_domain}")
-    # TODO: pre-load models here (Whisper, spaCy, LLM, FAISS index)
+
+    # Initialize database tables (non-fatal)
+    try:
+        from app.storage import init_db
+        init_db()
+    except Exception as e:
+        logger.warning(f"DB init skipped: {e}")
+
+    # Pre-load RAG retriever (FAISS index + bge-m3 model)
+    try:
+        from app.rag_engine import retriever as rag_retriever
+        rag_retriever.load()
+    except Exception as e:
+        logger.warning(f"RAG preload skipped: {e}")
+
     yield
     logger.info("🛑 Shutting down ConvI API")
 

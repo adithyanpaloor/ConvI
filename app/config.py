@@ -47,8 +47,9 @@ class Settings(BaseSettings):
     # ── bge-m3 ───────────────────────────────────────────────
     embedding_model: str = "BAAI/bge-m3"
 
-    # ── Local LLM (Qwen2.5) ──────────────────────────────────
-    llm_model_path: str = "Qwen/Qwen2.5-7B-Instruct"
+    # ── Local LLM (Qwen2.5 via Ollama) ──────────────────────────────────
+    ollama_url: str = "http://localhost:11434"
+    ollama_model: str = "qwen2.5:7b"
     llm_max_new_tokens: int = 1024
 
 
